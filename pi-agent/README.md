@@ -33,7 +33,7 @@ Gives pi-coding-agent and any pi-mono-based runtime cross-session, cross-engine 
 
 ## Installation
 
-Requires the claude-mem worker running on `localhost:37777`. Install claude-mem first via `npx claude-mem install` or run the worker from source.
+Requires the claude-mem worker running on `localhost:37701`. Install claude-mem first via `npx claude-mem install` or run the worker from source.
 
 ### From npm (recommended)
 
@@ -63,6 +63,16 @@ pi
 /memory-status
 ```
 
+## What is New
+
+### v0.3.5 - Loop Prevention & Debug Logging
+- ✨ **Loop Prevention** - Max 10 context injections per session prevents infinite loops
+- ✨ **Duplicate Detection** - Hash-based deduplication skips identical context
+- ✨ **Debug Logging** - Enable with `PI_MEM_DEBUG=1` for full visibility
+- ✨ **Connection Info** - Shows worker URL on startup
+- ✨ **Enhanced Error Handling** - Better null checks and error messages
+- ✨ **Port Flexibility** - `CLAUDE_MEM_WORKER_PORT` environment variable support
+
 ## What It Does
 
 - **Captures observations** — every tool call your pi-agent makes is recorded to claude-mem's database
@@ -88,7 +98,7 @@ Pi-Agent (pi-coding-agent / OpenClaw / custom)
     └── memory_recall tool     ──→  GET  /api/search
                                          │
                                          ▼
-                            claude-mem worker (port 37777)
+                            claude-mem worker (port 37701 (default))
                             SQLite + FTS5 + Chroma
                             Shared across all engines
 ```
@@ -111,7 +121,9 @@ Derived from the OpenClaw plugin (`claude-mem/openclaw/src/index.ts`), which is 
 
 | Variable | Default | Description |
 |---|---|---|
-| `CLAUDE_MEM_PORT` | `37777` | Worker service port |
+| `PI_MEM_DEBUG` | `0` | Enable debug logging (`1`) |
+| `CLAUDE_MEM_WORKER_PORT` | — | Worker port (overrides CLAUDE_MEM_PORT) |
+| `CLAUDE_MEM_PORT` | `37701 (default for uid 501)` | Worker service port |
 | `CLAUDE_MEM_HOST` | `127.0.0.1` | Worker service host |
 | `PI_MEM_PROJECT` | (derived from cwd) | Project name for scoping observations |
 | `PI_MEM_DISABLED` | — | Set to `1` to disable the extension |
