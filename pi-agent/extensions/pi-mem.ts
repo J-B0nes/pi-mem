@@ -12,7 +12,7 @@
  *   — or —
  *   pi install git:github.com/thedotmack/claude-mem --extensions pi-agent/extensions
  *
- * Requires: claude-mem worker running on localhost:37777
+ * Requires: claude-mem worker running (default port 37701, configurable via CLAUDE_MEM_PORT env var or ~/.claude-mem/settings.json)
  */
 
 import { Type } from "@mariozechner/pi-ai";
@@ -29,6 +29,7 @@ const DEFAULT_WORKER_PORT = 37777;
 
 function discoverWorkerHost(): string {
   if (process.env.CLAUDE_MEM_HOST) return process.env.CLAUDE_MEM_HOST;
+  if (process.env.CLAUDE_MEM_WORKER_HOST) return process.env.CLAUDE_MEM_WORKER_HOST;
   const settingsDir = process.env.CLAUDE_MEM_DATA_DIR || join(homedir(), ".claude-mem");
   const settingsPath = join(settingsDir, "settings.json");
   if (existsSync(settingsPath)) {
@@ -45,14 +46,18 @@ function discoverWorkerPort(): number {
     const parsed = parseInt(process.env.CLAUDE_MEM_PORT, 10);
     if (Number.isFinite(parsed)) return parsed;
   }
+  if (process.env.CLAUDE_MEM_WORKER_PORT) {
+    const parsed = parseInt(process.env.CLAUDE_MEM_WORKER_PORT, 10);
+    if (Number.isFinite(parsed)) return parsed;
+  }
   const settingsDir = process.env.CLAUDE_MEM_DATA_DIR || join(homedir(), ".claude-mem");
   const settingsPath = join(settingsDir, "settings.json");
   if (existsSync(settingsPath)) {
     try {
       const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
-      if (typeof settings.CLAUDE_MEM_WORKER_PORT === "number" && Number.isFinite(settings.CLAUDE_MEM_WORKER_PORT)) {
-        return settings.CLAUDE_MEM_WORKER_PORT;
-      }
+      const rawPort = settings.CLAUDE_MEM_WORKER_PORT;
+      const parsed = typeof rawPort === "number" ? rawPort : parseInt(String(rawPort), 10);
+      if (Number.isFinite(parsed)) return parsed;
     } catch { /* ignore parse/read errors */ }
   }
   return DEFAULT_WORKER_PORT;
@@ -65,6 +70,13 @@ const MAX_TOOL_RESPONSE_LENGTH = 1000;
 const SESSION_COMPLETE_DELAY_MS = 3000;
 const WORKER_FETCH_TIMEOUT_MS = 10_000;
 const MAX_SEARCH_LIMIT = 100;
+
+// Debug logging helper
+function debugLog(...args: any[]) {
+  if (process.env.PI_MEM_DEBUG === "1") {
+    console.log("[pi-mem]", ...args);
+  }
+}
 
 // =============================================================================
 // HTTP Helpers
@@ -88,7 +100,9 @@ function createTimeoutController(): { controller: AbortController; clear: () => 
 async function workerPost(path: string, body: Record<string, unknown>): Promise<Record<string, unknown> | null> {
 	const { controller, clear } = createTimeoutController();
 	try {
-		const response = await fetch(workerUrl(path), {
+		const url = workerUrl(path);
+		debugLog("POST", url, body);
+		const response = await fetch(url, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
@@ -98,7 +112,9 @@ async function workerPost(path: string, body: Record<string, unknown>): Promise<
 			console.error(`[pi-mem] Worker POST ${path} returned ${response.status}`);
 			return null;
 		}
-		return (await response.json()) as Record<string, unknown>;
+		const result = await response.json();
+		debugLog("POST response:", result);
+		return result;
 	} catch (error: unknown) {
 		if (error instanceof DOMException && error.name === "AbortError") {
 			console.error(`[pi-mem] Worker POST ${path} timed out after ${WORKER_FETCH_TIMEOUT_MS}ms`);
@@ -113,7 +129,9 @@ async function workerPost(path: string, body: Record<string, unknown>): Promise<
 }
 
 function workerPostFireAndForget(path: string, body: Record<string, unknown>): void {
-	fetch(workerUrl(path), {
+	const url = workerUrl(path);
+	debugLog("Fire-and-forget POST", url, body);
+	fetch(url, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(body),
@@ -126,12 +144,16 @@ function workerPostFireAndForget(path: string, body: Record<string, unknown>): v
 async function workerGetText(path: string): Promise<string | null> {
 	const { controller, clear } = createTimeoutController();
 	try {
-		const response = await fetch(workerUrl(path), { signal: controller.signal });
+		const url = workerUrl(path);
+		debugLog("GET", url);
+		const response = await fetch(url, { signal: controller.signal });
 		if (!response.ok) {
 			console.error(`[pi-mem] Worker GET ${path} returned ${response.status}`);
 			return null;
 		}
-		return await response.text();
+		const text = await response.text();
+		debugLog("GET response length:", text.length);
+		return text;
 	} catch (error: unknown) {
 		if (error instanceof DOMException && error.name === "AbortError") {
 			console.error(`[pi-mem] Worker GET ${path} timed out after ${WORKER_FETCH_TIMEOUT_MS}ms`);
@@ -153,11 +175,11 @@ async function workerGetText(path: string): Promise<string | null> {
 // =============================================================================
 
 function deriveProjectName(cwd: string): string {
-	if (process.env.PI_MEM_PROJECT) {
-		return process.env.PI_MEM_PROJECT;
-	}
-	const dir = basename(cwd);
-	return `pi-${dir}`;
+  if (process.env.PI_MEM_PROJECT) {
+    return process.env.PI_MEM_PROJECT;
+  }
+  const dir = basename(cwd);
+  return `pi-${dir}`;
 }
 
 // =============================================================================
@@ -169,11 +191,18 @@ export default function piMemExtension(pi: ExtensionAPI) {
 	let contentSessionId: string | null = null;
 	let projectName = "pi-agent";
 	let sessionCwd = process.cwd();
+	let lastContextHash: string | null = null;
+	let contextInjectionCount = 0;
+	const MAX_CONTEXT_INJECTIONS = 10; // Prevent infinite loops
 
 	// Check kill switch
 	if (process.env.PI_MEM_DISABLED === "1") {
+		console.log("[pi-mem] Extension disabled via PI_MEM_DISABLED=1");
 		return;
 	}
+
+	// Log connection info
+	console.log(`[pi-mem] Connecting to claude-mem worker at ${WORKER_HOST}:${WORKER_PORT}`);
 
 	// =========================================================================
 	// Event: session_start
@@ -187,9 +216,11 @@ export default function piMemExtension(pi: ExtensionAPI) {
 		sessionCwd = ctx.cwd;
 		projectName = deriveProjectName(sessionCwd);
 		contentSessionId = `pi-${projectName}-${Date.now()}`;
+		contextInjectionCount = 0; // Reset per session
 
 		// Persist session ID into the session file for compaction recovery
 		pi.appendEntry("pi-mem-session", { contentSessionId, projectName });
+		debugLog("Session started:", contentSessionId, "project:", projectName);
 	});
 
 	// =========================================================================
@@ -203,14 +234,23 @@ export default function piMemExtension(pi: ExtensionAPI) {
 	// =========================================================================
 
 	pi.on("before_agent_start", async (event) => {
-		if (!contentSessionId) return;
+		if (!contentSessionId) {
+			console.error("[pi-mem] No contentSessionId available, skipping worker init");
+			return;
+		}
 
-		await workerPost("/api/sessions/init", {
+		const result = await workerPost("/api/sessions/init", {
 			contentSessionId,
 			project: projectName,
 			prompt: event.prompt || "pi-agent session",
 			platformSource: PLATFORM_SOURCE,
 		});
+
+		if (result) {
+			debugLog("Session initialized:", result);
+		} else {
+			console.warn("[pi-mem] Failed to initialize session in worker");
+		}
 
 		return undefined;
 	});
@@ -228,15 +268,38 @@ export default function piMemExtension(pi: ExtensionAPI) {
 	// Mirrors openclaw/src/index.ts lines 743-759, but uses pi-mono's
 	// ContextEventResult (returning messages array) instead of OpenClaw's
 	// appendSystemContext.
+	//
+	// IMPORTANT: To prevent infinite loops, we limit the number of context
+	// injections per session and avoid re-injecting identical context.
 	// =========================================================================
 
 	pi.on("context", async (event) => {
 		if (!contentSessionId) return;
 
+		// Prevent infinite context injection loops
+		if (contextInjectionCount >= MAX_CONTEXT_INJECTIONS) {
+			console.warn(`[pi-mem] Max context injections (${MAX_CONTEXT_INJECTIONS}) reached, skipping`);
+			return;
+		}
+
 		const projects = encodeURIComponent(projectName);
 		const contextText = await workerGetText(`/api/context/inject?projects=${projects}`);
 
-		if (!contextText || contextText.trim().length === 0) return;
+		if (!contextText || contextText.trim().length === 0) {
+			debugLog("No context to inject");
+			return;
+		}
+
+		// Avoid injecting duplicate context (can cause loops)
+		const contextHash = contextText.trim();
+		if (contextHash === lastContextHash) {
+			debugLog("Skipping duplicate context injection");
+			return;
+		}
+
+		contextInjectionCount++;
+		lastContextHash = contextHash;
+		debugLog(`Injecting context (count: ${contextInjectionCount})`);
 
 		// Inject as a user message with XML tags to delineate memory context
 		return {
@@ -271,7 +334,10 @@ export default function piMemExtension(pi: ExtensionAPI) {
 		if (!toolName) return;
 
 		// Skip memory tools to prevent recursive observation loops
-		if (toolName === "memory_recall") return;
+		if (toolName === "memory_recall") {
+			debugLog("Skipping memory_recall tool observation");
+			return;
+		}
 
 		// Extract result text from content blocks
 		let toolResponseText = "";
@@ -286,6 +352,8 @@ export default function piMemExtension(pi: ExtensionAPI) {
 		if (toolResponseText.length > MAX_TOOL_RESPONSE_LENGTH) {
 			toolResponseText = toolResponseText.slice(0, MAX_TOOL_RESPONSE_LENGTH - 12) + " [truncated]";
 		}
+
+		debugLog("Recording observation for tool:", toolName);
 
 		workerPostFireAndForget("/api/sessions/observations", {
 			contentSessionId,
@@ -361,6 +429,7 @@ export default function piMemExtension(pi: ExtensionAPI) {
 	pi.on("session_compact", () => {
 		// Nothing to do — contentSessionId persists in extension state.
 		// Re-injection happens automatically via the next `context` event.
+		debugLog("Session compacted, preserving session ID");
 	});
 
 	// =========================================================================
@@ -371,6 +440,9 @@ export default function piMemExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => {
 		contentSessionId = null;
+		lastContextHash = null;
+		contextInjectionCount = 0;
+		debugLog("Session shutdown");
 	});
 
 	// =========================================================================
